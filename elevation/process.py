@@ -30,12 +30,17 @@ parser.add_argument('--true_loss',
             ' will be adjusted to this number.'))
 parser.add_argument('--smoothing',
         type=float,
-        default=0.3,
+        default=0.0,
         help=('When calculating gain/loss, smooth neighboring gpx points by this'
             ' factor. This helps reduce the noisiness of the data. Let S be the'
             ' smoothing factor. Then the elevation of gpx point P(n) is'
             ' recalculated as follows:'
             ' P_Smoothed(n) := (1 - S) * P(n) + S / * (P(n-1) + P(n+1))'))
+parser.add_argument('--gain_threshold',
+        type=int,
+        default=5,
+        help=('When calculating gain/loss, only consider points if their relative'
+            ' difference (in meters) exceeds this threshold.'))
 parser.add_argument(
         'gpxfile',
         metavar='N',
@@ -86,6 +91,7 @@ def lldist_cartesian(p1,p2):
 		dist += (b-a) ** 2
 	return sqrt(dist)
 
+
 def lldist_cartesian_elev(p1,p2):
 	# Meters to miles = meters / 1000 / MI_PER_KM
 	c1 = to_cart(p1, alt=R_EARTH_MILES + p1.elevation / 1000.0 / MI_PER_KM)
@@ -96,24 +102,12 @@ def lldist_cartesian_elev(p1,p2):
 	return sqrt(dist)
 
 
-
 def distance(points, dist_fn=lldist_haversine):
     """Calculates total distance between points in miles."""
     return sum(dist_fn(p,q) for p,q in zip(points, points[1:]))
 
 
-# Calculating elevation gain can be easy/complex based on the desired precision.
-# GPS data is inherently unstable/noisy. We can simply interpolate the three neighboring
-# points to smooth out the variability and then calculate deltas among those.
-def elevation_gain_loss(points):
-    """Returns (gain, loss) tuple (in meters). Smooths out elevations of neighboring pts.
-
-    smoothing: Number between 0.0 and 1.0 determining the weight of the point itself when
-      averaging elevation measurements. Remainder of 1-smoothing will be assigned to the
-      points previous/next neighbors distributed equally among the two.
-    """
-    smoothing = args.smoothing
-    elevations = [p.elevation for p in points]
+def smooth_elevations(elevations, smoothing=.25):
     smoothed = []
     for i, x in enumerate(elevations):
         prev = x
@@ -123,12 +117,31 @@ def elevation_gain_loss(points):
         if i < len(elevations) - 1:
             next = elevations[i+1]
         smoothed.append((1 - smoothing) * x + 0.5 * smoothing * (prev + next))
+    return smoothed
 
-    #for x in elevations:
-    #    avg_over = smoothed[-2:] + [x]  # Last 2 datapoints + this one
-    #    smoothed.append(float(sum(avg_ovrr)) / len(avg_over))
-    deltas = [b-a for a,b in zip(smoothed, smoothed[1:])]
-    return (sum(filter(lambda x: x>0, deltas)), sum(filter(lambda x: x<0, deltas)))
+# Calculating elevation gain can be easy/complex based on the desired precision.
+# GPS data is inherently unstable/noisy. We can simply interpolate the three neighboring
+# points to smooth out the variability and then calculate deltas among those.
+def elevation_gain_loss(points):
+    """Returns (gain, loss) tuple (in meters). Smooths out elevations of neighboring pts.
+    """
+    elevations = [p.elevation for p in points]
+    if args.smoothing:
+        elevations = smooth_elevations(elevations, smoothing=args.smoothing)
+
+    gain = 0
+    loss = 0
+    last_e = elevations[0]
+    for e in elevations:
+        diff = e - last_e
+        if abs(diff) < args.gain_threshold:
+            continue
+        last_e = e
+        if diff > 0:
+            gain += diff
+        else:
+            loss += diff
+    return (gain, loss)
 
 # Pick distance measurement.
 lldist = lldist_cartesian
@@ -153,29 +166,15 @@ def get_pct_segment(filename):
 # fixed distances and calculating (pct_mile_marker_start, total_gain_ft, total_loss_ft)
 # Granularity of the output should be controlled by segment_size (miles). Approximation
 # when two points are not exactly matching the boundaries may be necessary (or not).
-
-def smoothed_elevation_ft(idx, points, smoothing=0.3):
-    """Calculates smoothed elevation of idx-th point in points."""
-    curr = points[idx]
-    prev = points[idx]
-    next = points[idx]
-    if idx > 0:
-        prev = points[idx-1]
-    if idx < len(points) - 1:
-        next = points[idx+1]
-
-    return m2ft((1 - smoothing) * curr.elevation
-                + 0.5 * smoothing * (prev.elevation + next.elevation))
-
-
-def make_segments(points, segment_size=1, dist_fn=lldist_haversine, true_miles=None):
-
-    """Returns list of (segment_end_miles, segment_gain_ft, segment_loss_ft, num_pts).
+def split_by_distance(points, segment_length=1, dist_fn=lldist_haversine, true_miles=0.0):
+    """This function splits list of points into list of sub-list where each sublist has specified distance.
 
     Args:
-      true_miles: if set, this specifies the actual path distance in miles.
-        this will be used to even out the actual distance measurements to add up to
-        the expected distance.
+        segment_length: expected distance of each sub-list/segment in miles.
+        dist_fn: function to use when calculating distance between gpx points.
+        true_miles: Known distance of the entire segment. In case exact distance
+          measurements are off by some number, the overall distances will be
+          corrected so that the total distance matches true_miles.
     """
     distance_mult = 1.0
     if true_miles:
@@ -183,47 +182,33 @@ def make_segments(points, segment_size=1, dist_fn=lldist_haversine, true_miles=N
         # The points should be multiplied by true_miles / measured_miles to end up
         # with true_miles at the end.
         distance_mult = float(true_miles) / measured_miles
-    total_miles = 0
-    total_gain = 0
-    total_loss = 0
-    segment_start_miles = 0
-    segment_gain = 0
-    segment_loss = 0
-    prev_ft = None
-    prev_point = None
-    num_points = 0
-    for i, point in enumerate(points):
-        # Initialize the previous point and move on
-        if prev_point is None:
-            prev_point = point
-            prev_ft = smoothed_elevation_ft(i, points)
-            continue
 
-        num_points += 1
-        total_miles += distance_mult * dist_fn(prev_point, point)
-        curr_ft = smoothed_elevation_ft(i, points)
-        if curr_ft > prev_ft:
-            total_gain += curr_ft - prev_ft
-            segment_gain += curr_ft - prev_ft
-        else:
-            total_loss += curr_ft - prev_ft
-            segment_loss += curr_ft - prev_ft
+    output_segments = []
+    curr_segment = [] 
+    curr_segment_length = 0
+    last_pt = points[0]
+    for pt in points:
+        dist = distance_mult * dist_fn(last_pt, pt)
+        # TODO(jaro): we could improve accurracy by:
+        # 1. picking to include this point into previous/next segment based on
+        #    the distance to the boundary point (this may not make a difference in
+        #    aggregate)
+        # 2. constructing split-points and averaging their elevations.
+        #
+        # As of now, we simply add up points until they exceed the segment length
+        # and average these numbers afterwards.
+        curr_segment_length += dist
+        curr_segment.append(pt)
+        last_pt = pt
 
-        # Move the needle
-        prev_point = point
-        prev_ft = curr_ft
+        if curr_segment_length >= segment_length:
+            yield curr_segment
+            curr_segment = [pt]
+            curr_segment_length = 0
 
-        # Segment is "at least" segment_size now, emit
-        if total_miles - segment_start_miles >= segment_size:
-            yield (total_miles, segment_gain, segment_loss, num_points)
-            segment_start_miles = total_miles
-            segment_gain = 0
-            segment_loss = 0
-            num_points = 0
-
-    if total_miles > segment_start_miles:
-        yield (total_miles, segment_gain, segment_loss, num_points)
-
+    # Add the last (possibly shorter) segment
+    if curr_segment_length > 0:
+        yield curr_segment
 
 
 # print "Section\tMiles\tGain(ft)\tLoss(ft)"
@@ -236,14 +221,25 @@ for f in args.gpxfile:
     # print "%.2f\t%.2f" % (m2ft(gain), m2ft(loss))
     # Now print the segmentations
     # print "Total points in segment: {0}".format(len(s.points))
-    sg = make_segments(s.points, segment_size=args.segment_size, true_miles=args.true_miles)
-    sg_gain = 0
-    sg_loss = 0
+    dist_mult = 1.0
+    if args.true_miles:
+        dist_mult = args.true_miles / distance(s.points)
+
+    segs = split_by_distance(s.points, segment_length=args.segment_size, true_miles=args.true_miles)
+
     header = ''
     if args.section_header:
         header = '%s\t' % args.section_header
-    for s in sg:
-        print (header + '%2f\t%.2f\t%.2f\t%d' % s)
-        sg_gain += s[1]
-        sg_loss += s[2]
-    # print '*** Total gain %.2f loss %.2f' % (sg_gain, sg_loss)
+
+    total_gain, total_loss = 0, 0
+    total_distance = 0
+    for sg in segs:
+        sg_gain, sg_loss = elevation_gain_loss(sg)
+        total_gain += sg_gain
+        total_loss += sg_loss
+        total_distance += dist_mult * distance(sg)
+        print (header + '%2f\t%.2f\t%.2f\t%d' % (
+            total_distance, m2ft(sg_gain), m2ft(sg_loss), len(sg)))
+    print '*** Total gain for %s %.2f loss %.2f' % (
+            f,
+            m2ft(total_gain), m2ft(total_loss))
